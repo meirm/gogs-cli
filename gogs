@@ -51,7 +51,8 @@ function run_curl_and_log {
 		echo "$output" > log_curl_response.txt
 		echo -n "$output"
 	else
-		"$@" 2> /dev/null
+		output=`"$@" 2> /dev/null`
+		echo -n "$output"
 	fi
 }
 
@@ -60,23 +61,29 @@ function gogs-curl {
 	auth="?token=$gogs_token"
 	cmd=$2
 	data="$3"
-	address=$gogs_server"/api/v1"$cmd$auth
+	# Remove trailing slash from server URL if present, then add API path
+	server_url=${gogs_server%/}
+	address=$server_url"/api/v1"$cmd$auth
 
 	if is-debug; then
-		echo \#
-		echo -e "# Method:  $method"
-		echo -e "# Command: $cmd"
-		echo -e "# Address: $address"
-		echo -e "# Data:    $data"
+		echo \# >&2
+		echo -e "# Method:  $method" >&2
+		echo -e "# Command: $cmd" >&2
+		echo -e "# Address: $address" >&2
+		echo -e "# Data:    $data" >&2
 	fi
 	if ! $dry_run; then
-		echo
+		if is-debug; then
+			echo >&2
+		fi
 		sleep 1s
 		if [ -n "$data" ]; then
 			run_curl_and_log curl -d "$data" -H "Content-Type: application/json" -X $method "$address" --insecure
 		else
 			run_curl_and_log curl -X $method "$address" --insecure
 		fi
+	else
+		echo ""
 	fi
 }
 
@@ -85,24 +92,30 @@ function gogs-curl-basic {
 	auth=$2
 	cmd=$3
 	data="$4"
-	address=$gogs_server"/api/v1"$cmd
+	# Remove trailing slash from server URL if present, then add API path
+	server_url=${gogs_server%/}
+	address=$server_url"/api/v1"$cmd
 
 	if is-debug; then
-		echo \#
-		echo -e "# Method:  $method"
-		echo -e "# Auth:    $auth"
-		echo -e "# Command: $cmd"
-		echo -e "# Address: $address"
-		echo -e "# Data:    $data"
+		echo \# >&2
+		echo -e "# Method:  $method" >&2
+		echo -e "# Auth:    $auth" >&2
+		echo -e "# Command: $cmd" >&2
+		echo -e "# Address: $address" >&2
+		echo -e "# Data:    $data" >&2
 	fi
 	if ! $dry_run; then
-		echo
+		if is-debug; then
+			echo >&2
+		fi
 		sleep 1s
 		if [ -n "$data" ]; then
 			run_curl_and_log curl -u $auth -d "$data" -H "Content-Type: application/json" -X $method "$address" --insecure
 		else
 			run_curl_and_log curl -u $auth -X $method "$address" --insecure
 		fi
+	else
+		echo ""
 	fi
 }
 
@@ -177,7 +190,7 @@ function json-property {
 		echo "$2"
 	else
 		cat
-	fi | sed "0,/\"$1\"/{s/\"$1\"/@@@/}" | sed -nE "s/^.*@@@:(\
+	fi | sed "0,/\"$1\"/{s/\"$1\"/@@@/;}" | sed -nE "s/^.*@@@:(\
 (true)|\
 (false)|\
 ([0-9]+)|\
@@ -597,7 +610,7 @@ function list-own-repos {
 	if is-debug; then
 		echo "$response"
 	else
-		echo "$response" | split-json "}}," "{" | per-line "json-property name"
+		echo "$response" | sed 's/},/}\n{/g' | while read -r line; do echo $line | sed 's/.*"name":"\([^"]*\)".*/\1/'; done
 	fi
 }
 
@@ -612,7 +625,7 @@ function list-org-repos {
 	if is-debug; then
 		echo "$response"
 	else
-		echo "$response" | split-json "}}," "{" | per-line "json-property name"
+		echo "$response" | split-json "}," "{" | per-line "json-property name"
 	fi
 }
 
@@ -627,7 +640,7 @@ function list-user-repos {
 	if is-debug; then
 		echo "$response"
 	else
-		echo "$response" | split-json "}}," "{" | per-line "json-property name"
+		echo "$response" | split-json "}," "{" | per-line "json-property name"
 	fi
 }
 
@@ -888,6 +901,242 @@ function enable-issues {
 	echo-and-exit-code--error-if-message "$output"
 }
 
+actions=$actions" -"
+
+actions=$actions" create-issue"
+function create-issue {
+	syntax-help 3 "user/org-name repo-name title [description]" "$@"
+
+	check-user-org-exists-not $1; return-exit-code-if-error
+	check-repo-exists-not $1 $2; return-exit-code-if-error
+
+	# Build the request data
+	request="\"title\":\"$3\""
+	if [ -n "$4" ]; then
+		request="$request,\"body\":\"$4\""
+	fi
+
+	output=`gogs-curl POST /repos/$1/$2/issues "{$request}"`
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
+actions=$actions" list-issues"
+function list-issues {
+	syntax-help 2 "user/org-name repo-name [state:open/closed/all]" "$@"
+
+	check-user-org-exists-not $1; return-exit-code-if-error
+	check-repo-exists-not $1 $2; return-exit-code-if-error
+
+	# Set default state to open if not specified
+	state=${3:-open}
+
+	response=`gogs-curl GET /repos/$1/$2/issues?state=$state`
+
+	if is-debug; then
+		echo "$response"
+	else
+		echo "$response" | split-json "}," "{" | per-line "json-properties number title state"
+	fi
+}
+
+actions=$actions" get-issue"
+function get-issue {
+	syntax-help 3 "user/org-name repo-name issue-number [property]" "$@"
+
+	check-user-org-exists-not $1; return-exit-code-if-error
+	check-repo-exists-not $1 $2; return-exit-code-if-error
+
+	response=`gogs-curl GET /repos/$1/$2/issues/$3`
+
+	if [ -z "$response" ]; then
+		echo-error Issue \#$3 does NOT exist
+		return 1
+	elif [ -z $4 ] || is-debug; then
+		output="$response"
+	else
+		output=`echo "$response" | json-property "$4"`
+	fi
+
+	echo-and-exit-code--error-if-empty "$output"
+}
+
+actions=$actions" update-issue"
+function update-issue {
+	syntax-help 4 "user/org-name repo-name issue-number (title|state|body) new-value" "$@"
+
+	check-user-org-exists-not $1; return-exit-code-if-error
+	check-repo-exists-not $1 $2; return-exit-code-if-error
+
+	# Build the request data based on the field to update
+	request=""
+	case $4 in
+		title) request="\"title\":\"$5\"" ;;
+		state) request="\"state\":\"$5\"" ;;
+		body) request="\"body\":\"$5\"" ;;
+		*) echo-error Invalid field: $4. Use title, state, or body; return 1 ;;
+	esac
+
+	output=`gogs-curl PATCH /repos/$1/$2/issues/$3 "{$request}"`
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
+actions=$actions" add-issue-comment"
+function add-issue-comment {
+	syntax-help 4 "user/org-name repo-name issue-number comment" "$@"
+
+	check-user-org-exists-not $1; return-exit-code-if-error
+	check-repo-exists-not $1 $2; return-exit-code-if-error
+
+	output=`gogs-curl POST /repos/$1/$2/issues/$3/comments "{\"body\":\"$4\"}"`
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
+actions=$actions" list-issue-comments"
+function list-issue-comments {
+	syntax-help 3 "user/org-name repo-name issue-number" "$@"
+
+	check-user-org-exists-not $1; return-exit-code-if-error
+	check-repo-exists-not $1 $2; return-exit-code-if-error
+
+	response=`gogs-curl GET /repos/$1/$2/issues/$3/comments`
+
+	if is-debug; then
+		echo "$response"
+	else
+		echo "$response" | split-json "}," "{" | per-line "json-properties user body"
+	fi
+}
+
+actions=$actions" -"
+
+actions=$actions" create-pull-request"
+function create-pull-request {
+	syntax-help 5 "user/org-name repo-name title head-branch base-branch [description]" "$@"
+
+	check-user-org-exists-not $1; return-exit-code-if-error
+	check-repo-exists-not $1 $2; return-exit-code-if-error
+
+	# Build the request data
+	request="\"title\":\"$3\",\"head\":\"$4\",\"base\":\"$5\""
+	if [ -n "$6" ]; then
+		request="$request,\"body\":\"$6\""
+	fi
+
+	output=`gogs-curl POST /repos/$1/$2/pulls "{$request}"`
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
+actions=$actions" list-pull-requests"
+function list-pull-requests {
+	syntax-help 2 "user/org-name repo-name [state:open/closed/all]" "$@"
+
+	check-user-org-exists-not $1; return-exit-code-if-error
+	check-repo-exists-not $1 $2; return-exit-code-if-error
+
+	# Set default state to open if not specified
+	state=${3:-open}
+
+	response=`gogs-curl GET /repos/$1/$2/pulls?state=$state`
+
+	if is-debug; then
+		echo "$response"
+	else
+		echo "$response" | split-json "}," "{" | per-line "json-properties number title state"
+	fi
+}
+
+actions=$actions" get-pull-request"
+function get-pull-request {
+	syntax-help 3 "user/org-name repo-name pr-number [property]" "$@"
+
+	check-user-org-exists-not $1; return-exit-code-if-error
+	check-repo-exists-not $1 $2; return-exit-code-if-error
+
+	response=`gogs-curl GET /repos/$1/$2/pulls/$3`
+
+	if [ -z "$response" ]; then
+		echo-error Pull request \#$3 does NOT exist
+		return 1
+	elif [ -z $4 ] || is-debug; then
+		output="$response"
+	else
+		output=`echo "$response" | json-property "$4"`
+	fi
+
+	echo-and-exit-code--error-if-empty "$output"
+}
+
+actions=$actions" update-pull-request"
+function update-pull-request {
+	syntax-help 4 "user/org-name repo-name pr-number (title|state|body) new-value" "$@"
+
+	check-user-org-exists-not $1; return-exit-code-if-error
+	check-repo-exists-not $1 $2; return-exit-code-if-error
+
+	# Build the request data based on the field to update
+	request=""
+	case $4 in
+		title) request="\"title\":\"$5\"" ;;
+		state) request="\"state\":\"$5\"" ;;
+		body) request="\"body\":\"$5\"" ;;
+		*) echo-error Invalid field: $4. Use title, state, or body; return 1 ;;
+	esac
+
+	output=`gogs-curl PATCH /repos/$1/$2/pulls/$3 "{$request}"`
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
+actions=$actions" add-pull-request-comment"
+function add-pull-request-comment {
+	syntax-help 4 "user/org-name repo-name pr-number comment" "$@"
+
+	check-user-org-exists-not $1; return-exit-code-if-error
+	check-repo-exists-not $1 $2; return-exit-code-if-error
+
+	output=`gogs-curl POST /repos/$1/$2/pulls/$3/comments "{\"body\":\"$4\"}"`
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
+actions=$actions" list-pull-request-comments"
+function list-pull-request-comments {
+	syntax-help 3 "user/org-name repo-name pr-number" "$@"
+
+	check-user-org-exists-not $1; return-exit-code-if-error
+	check-repo-exists-not $1 $2; return-exit-code-if-error
+
+	response=`gogs-curl GET /repos/$1/$2/pulls/$3/comments`
+
+	if is-debug; then
+		echo "$response"
+	else
+		echo "$response" | split-json "}," "{" | per-line "json-properties user body"
+	fi
+}
+
+actions=$actions" merge-pull-request"
+function merge-pull-request {
+	syntax-help 3 "user/org-name repo-name pr-number [merge-message]" "$@"
+
+	check-user-org-exists-not $1; return-exit-code-if-error
+	check-repo-exists-not $1 $2; return-exit-code-if-error
+
+	# Build the request data
+	request=""
+	if [ -n "$4" ]; then
+		request="\"merge_commit_message\":\"$4\""
+	fi
+
+	output=`gogs-curl POST /repos/$1/$2/pulls/$3/merge "{$request}"`
+
+	echo-and-exit-code--error-if-message "$output"
+}
+
 # cmd interface ----------
 
 function print-help {
@@ -936,9 +1185,9 @@ function print-help {
 		echo "  Authenticated as:"
 		echo -n "  ... "
 		response=`get-api-token-user`
-		r_login=`echo "$response" | json-property username`
-		r_name=`echo "$response" | json-property full_name`
-		r_email=`echo "$response" | json-property email`
+		r_login=`echo "$response" | sed 's/.*"username":"\([^"]*\)".*/\1/'`
+		r_name=`echo "$response" | sed 's/.*"full_name":"\([^"]*\)".*/\1/'`
+		r_email=`echo "$response" | sed 's/.*"email":"\([^"]*\)".*/\1/'`
 		echo -en "\r  $r_login"
 		if [ ! -z "$r_name" ]; then echo -n " ($r_name)"; fi
 		echo " / $r_email"
